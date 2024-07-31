@@ -1,8 +1,10 @@
 import numpy as np
+import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib import patches
 from matplotlib.animation import FuncAnimation
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+from parameters import AGENT_PERCEPTION_RANGE
 
 
 class TaskEnv:
@@ -32,6 +34,7 @@ class TaskEnv:
         self.force_wait = True
         self.reactive_planning = False
         self.visible_length = 0
+        self.perception_range = AGENT_PERCEPTION_RANGE
 
     def random_int(self, low, high, size=None):
         if self.rng is not None:
@@ -53,6 +56,25 @@ class TaskEnv:
         else:
             choice = np.random.choice(a, size, replace)
         return choice
+    
+    def get_agents_in_fov(self, agent):
+        x_min, x_max, y_min, y_max = self.get_perception_area(agent['location'])
+        agents_in_fov = []
+        for a in self.agent_dic.values():
+            if a['ID'] != agent['ID']:
+                ax, ay = np.clip(a['location'] * 10, 0, self.grid_size - 1).astype(int)
+                if x_min <= ax < x_max and y_min <= ay < y_max:
+                    agents_in_fov.append(a)
+        return agents_in_fov
+    
+    def get_tasks_in_fov(self, agent):
+        x_min, x_max, y_min, y_max = self.get_perception_area(agent['location'])
+        tasks_in_fov = []
+        for t in self.task_dic.values():
+            tx, ty = np.clip(t['location'] * 10, 0, self.grid_size - 1).astype(int)
+            if x_min <= tx < x_max and y_min <= ty < y_max:
+                tasks_in_fov.append(t)
+        return tasks_in_fov
 
     def generate_env(self):
         if type(self.tasks_range) is tuple:
@@ -64,6 +86,8 @@ class TaskEnv:
         else:
             agents_num = self.agents_range
         agents_ini = np.ones((agents_num, self.traits_dim))
+        agents_capacity = self.random_value(agents_num, 1)  # Generate random capacity values
+        tasks_weight = self.random_value(tasks_num, 1)  # Generate random weight values
         depot = self.random_value(1, 2)
         cost_ini = self.random_value(agents_num, 1)
         tasks_loc = self.random_value(tasks_num, 2)
@@ -86,6 +110,7 @@ class TaskEnv:
                            'time': float(tasks_time[i, :]),
                            'sum_waiting_time': 0,
                            'efficiency': 0,
+                           'weight': float(tasks_weight[i, 0]),  # Add weight attribute
                            'abandoned_agent': []}
         for i in range(agents_num):
             agent_dic[i] = {'ID': i,
@@ -107,7 +132,9 @@ class TaskEnv:
                             'angle': 0,
                             'returned': False,
                             'assigned': False,
-                            'pre_set_route': None}
+                            'capacity': float(agents_capacity[i, 0]),  # Add capacity attribute
+                            'pre_set_route': None,
+                            'capacity': float(np.random.rand())}
         depot = {'location': depot[0, :],
                  'members': [],
                  'ID': -1}
@@ -161,33 +188,88 @@ class TaskEnv:
     @staticmethod
     def calculate_eulidean_distance(agent, task):
         return np.linalg.norm(agent['location'] - task['location'])
+    
+    def get_perception_area(self, agent_location):
+        """Get the boundaries of the agent's perception area."""
+        x, y = np.clip(agent_location * 10, 0, self.grid_size - 1).astype(int)
+        x_min = max(0, x - self.perception_range // 2)
+        x_max = min(self.grid_size, x + self.perception_range // 2 + 1)
+        y_min = max(0, y - self.perception_range // 2)
+        y_max = min(self.grid_size, y + self.perception_range // 2 + 1)
+        return x_min, x_max, y_min, y_max
+    
+    def compute_affordance(self, agent):
+        n = self.perception_range
+        affordance_map = np.zeros((n, n))
+        x_min, x_max, y_min, y_max = self.get_perception_area(agent['location'])
+        
+        agents_in_fov = self.get_agents_in_fov(agent)
+        tasks_in_fov = self.get_tasks_in_fov(agent)
+        
+        for i in range(n):
+            for j in range(n):
+                grid_x, grid_y = x_min + i, y_min + j
+                if 0 <= grid_x < self.grid_size and 0 <= grid_y < self.grid_size:
+                    pos = np.array([grid_x, grid_y])
+                    
+                    # Calculate affordance based on teammates
+                    for teammate in agents_in_fov:
+                        distance = np.linalg.norm(pos - teammate['location']) + 0.1
+                        affordance_map[i, j] += teammate['capacity'] / distance
+                    
+                    # Adjust affordance based on tasks
+                    for task in tasks_in_fov:
+                        if np.array_equal(pos, task['location']):
+                            affordance_map[i, j] *= 1 / task['weight']  # Reduce affordance for high-weight tasks
+        
+        # Normalize the affordance map
+        affordance_map = (affordance_map - affordance_map.min()) / (affordance_map.max() - affordance_map.min() + 1e-8)
+        return affordance_map
+        
+    def get_current_agent_status(self, agent_id):
+        agent = self.agent_dic[agent_id]
+        affordance_map = self.compute_affordance(agent)
 
-    def get_current_agent_status(self, agent):
-        status = []
+        teammate_info = []
+        x_min, x_max, y_min, y_max = self.get_perception_area(agent['location'])
         for a in self.agent_dic.values():
-            if len(a['route']) > 0 and a['route'][-1] in self.task_dic.keys():
-                travel_time = np.clip(self.get_arrival_time(a['ID'], a['route'][-1]) - self.current_time, a_min=0, a_max=None)
-                current_waiting_time = np.clip(self.current_time - self.get_arrival_time(a['ID'], a['route'][-1]), a_min=0, a_max=None) if self.current_time <= self.task_dic[a['route'][-1]]['time_start'] else 0
-                remaining_working_time = np.clip(self.task_dic[a['route'][-1]]['time_start'] + self.task_dic[a['route'][-1]]['time'] - self.current_time, a_min=0, a_max=None) if self.current_time >= self.task_dic[a['route'][-1]]['time_start'] else 0
-            else:
-                travel_time = 0
-                current_waiting_time = 0
-                remaining_working_time = 0
-            temp_status = np.hstack([travel_time, remaining_working_time, current_waiting_time,
-                                     agent['location'] - a['location'], a['assigned']])
-            status.append(temp_status)
-        current_agents = np.vstack(status)
-        return current_agents
+            if a['ID'] != agent_id:
+                ax, ay = np.clip(a['location'] * 10, 0, self.grid_size - 1).astype(int)
+                if x_min <= ax < x_max and y_min <= ay < y_max:
+                    relative_pos = a['location'] - agent['location']
+                    teammate_info.extend([relative_pos[0], relative_pos[1], a['capacity']])
 
-    def get_current_task_status(self, agent):
+        if len(agent['route']) > 0 and agent['route'][-1] in self.task_dic.keys():
+            travel_time = np.clip(self.get_arrival_time(agent['ID'], agent['route'][-1]) - self.current_time, a_min=0, a_max=None)
+            current_waiting_time = np.clip(self.current_time - self.get_arrival_time(agent['ID'], agent['route'][-1]), a_min=0, a_max=None) if self.current_time <= self.task_dic[agent['route'][-1]]['time_start'] else 0
+            remaining_working_time = np.clip(self.task_dic[agent['route'][-1]]['time_start'] + self.task_dic[agent['route'][-1]]['time'] - self.current_time, a_min=0, a_max=None) if self.current_time >= self.task_dic[agent['route'][-1]]['time_start'] else 0
+        else:
+            travel_time = 0
+            current_waiting_time = 0
+            remaining_working_time = 0
+
+        status = np.hstack([travel_time, remaining_working_time, current_waiting_time,
+                            agent['location'], agent['assigned'], agent['capacity'],
+                            affordance_map.flatten(), teammate_info])
+        
+        return status
+        
+    def get_current_task_status(self, agent_id):
+        agent = self.agent_dic[agent_id]
+        x_min, x_max, y_min, y_max = self.get_perception_area(agent['location'])
+        
         status = []
         for t in self.task_dic.values():
-            temp_status = np.hstack([t['status'], t['requirements'], t['time'],
-                                     t['location'] - agent['location']])
-            status.append(temp_status)
-        status = [np.hstack([0, 0, 0, self.depot['location'] - agent['location']])] + status
-        current_tasks = np.vstack(status)
-        return current_tasks
+            tx, ty = np.clip(t['location'] * 10, 0, self.grid_size - 1).astype(int)
+            if x_min <= tx < x_max and y_min <= ty < y_max:
+                relative_pos = t['location'] - agent['location']
+                temp_status = np.hstack([t['status'], t['requirements'], t['time'],
+                                        relative_pos, t['weight']])
+                status.append(temp_status)
+        
+        if len(status) == 0:
+            return np.array([])  # or some default value
+        return np.vstack(status)
 
     def get_unfinished_task_mask(self):
         mask = np.logical_not(self.get_unfinished_tasks())

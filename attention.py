@@ -1,22 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 from torch.cuda.amp.autocast_mode import autocast
+import argparse
 from parameters import *
-
-
-def get_attn_pad_mask(seq_q, seq_k):
-    batch_size, len_q = seq_q.sum(dim=2).size()
-    batch_size, len_k = seq_k.sum(dim=2).size()
-    # eq(zero) is PAD token
-    pad_attn_mask_k = seq_q.eq(-1).all(2).data.eq(1).unsqueeze(1)  # batch_size x 1 x len_q, one is masking
-    pad_attn_mask_q = seq_k.eq(-1).all(2).data.eq(1).unsqueeze(1)  # batch_size x 1 x len_k, one is masking
-    pad_attn_mask_k = pad_attn_mask_k.expand(batch_size, len_k, len_q).permute(0, 2, 1)
-    pad_attn_mask_q = pad_attn_mask_q.expand(batch_size, len_q, len_k)
-    return ~torch.logical_and(~pad_attn_mask_k, ~pad_attn_mask_q)  # batch_size x len_q x len_k
-
 
 def get_attn_subsequent_mask(seq):
     attn_shape = [seq.size(0), seq.size(1), seq.size(1)]
@@ -246,10 +236,16 @@ class Decoder(nn.Module):
 
 
 class AttentionNet(nn.Module):
-    def __init__(self, agent_input_dim, task_input_dim, embedding_dim):
+    def __init__(self, agent_input_dim, task_input_dim, embedding_dim, perception_range):
         super(AttentionNet, self).__init__()
-        self.agent_embedding = nn.Linear(agent_input_dim, embedding_dim)
-        self.task_embedding = nn.Linear(task_input_dim, embedding_dim)  # layer for input information
+        self.agent_embedding = nn.Linear(agent_input_dim - perception_range**2, embedding_dim)
+        self.task_embedding = nn.Linear(task_input_dim, embedding_dim)
+
+        # Add convolutional layers to process the affordance map
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc = nn.Linear(32, embedding_dim)
 
         self.taskEncoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
         self.crossDecoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=2)
@@ -258,6 +254,16 @@ class AttentionNet(nn.Module):
         self.globalDecoder2 = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=2)
         self.pointer = SingleHeadAttention(embedding_dim)
         # self.LSTM = nn.LSTM(embedding_dim, embedding_dim, batch_first=True)
+
+    def get_attn_pad_mask(self, seq_q, seq_k):
+        batch_size, len_q = seq_q.sum(dim=2).size()
+        batch_size, len_k = seq_k.sum(dim=2).size()
+        # eq(zero) is PAD token
+        pad_attn_mask_k = seq_q.eq(-1).all(2).data.eq(1).unsqueeze(1)  # batch_size x 1 x len_q, one is masking
+        pad_attn_mask_q = seq_k.eq(-1).all(2).data.eq(1).unsqueeze(1)  # batch_size x 1 x len_k, one is masking
+        pad_attn_mask_k = pad_attn_mask_k.expand(batch_size, len_k, len_q).permute(0, 2, 1)
+        pad_attn_mask_q = pad_attn_mask_q.expand(batch_size, len_q, len_k)
+        return ~torch.logical_and(~pad_attn_mask_k, ~pad_attn_mask_q)
 
     def encoding_tasks(self, task_inputs, mask=None):
         task_embedding = self.task_embedding(task_inputs)
@@ -286,16 +292,42 @@ class AttentionNet(nn.Module):
         return logp_list
 
     def forward(self, tasks, agents, mask):
-        task_mask = get_attn_pad_mask(tasks, tasks)
-        agent_mask = get_attn_pad_mask(agents, agents)
-        task_agent_mask = get_attn_pad_mask(tasks, agents)
-        compressed_task, task_encoding = self.encoding_tasks(tasks, mask=task_mask)
-        agents_encoding = self.encoding_agents(agents, mask=agent_mask)
+        # Split agent input into regular features and affordance map
+        agent_features = agents[:, :7]
+        affordance_maps = agents[:, 7:].view(-1, 1, int(math.sqrt(agents.size(1)-7)), int(math.sqrt(agents.size(1)-7)))
+        
+        # Process regular agent features
+        agent_embedded = self.agent_embedding(agent_features)
+        
+        # Process affordance maps
+        x = F.relu(self.conv1(affordance_maps))
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        affordance_embedded = self.fc(x.view(x.size(0), -1))
+        
+        # Combine regular features and affordance features
+        agent_embedded = agent_embedded + affordance_embedded
+        task_embedded = self.task_embedding(tasks)
+        
+        # Generate masks
+        task_mask = self.get_attn_pad_mask(tasks, tasks)
+        agent_mask = self.get_attn_pad_mask(agents, agents)
+        task_agent_mask = self.get_attn_pad_mask(tasks, agents)
+        
+        # Encode tasks and agents
+        compressed_task, task_encoding = self.encoding_tasks(task_embedded, mask=task_mask)
+        agents_encoding = self.encoding_agents(agent_embedded, mask=agent_mask)
+        
+        # Cross-decode task and agent features
         task_agent_feature = self.cross_decoding(task_encoding, agents_encoding, mask=task_agent_mask)
+        
+        # Global decoding
         current_state = self.globalDecoder1(compressed_task, agents_encoding)
+        
+        # Select coalition (or in this case, select task)
         logp_list = self.select_coalition(current_state, task_agent_feature, mask)
         return logp_list
-
+    
 
 def padding_inputs(inputs):
     seq = pad_sequence(inputs, batch_first=False, padding_value=1)
@@ -306,12 +338,36 @@ def padding_inputs(inputs):
     return seq, mask
 
 
+# if __name__ == '__main__':
+#     model = AttentionNet(2, 8)
+#     node_inputs = torch.torch.rand((128, 10, 2))
+#     current_index = torch.ones(size=(128, 1, 1), dtype=torch.int64)
+#     LSTM_h = torch.zeros((1, 1, 2))
+#     LSTM_c = torch.zeros((1, 1, 2))
+#     logp_list, value, LSTM_h, LSTM_c = model(node_inputs, current_index, LSTM_h, LSTM_c)
+#     print(logp_list.size())
+#     print(value.size())
+
 if __name__ == '__main__':
-    model = AttentionNet(2, 8)
-    node_inputs = torch.torch.rand((128, 10, 2))
-    current_index = torch.ones(size=(128, 1, 1), dtype=torch.int64)
-    LSTM_h = torch.zeros((1, 1, 2))
-    LSTM_c = torch.zeros((1, 1, 2))
-    logp_list, value, LSTM_h, LSTM_c = model(node_inputs, current_index, LSTM_h, LSTM_c)
-    print(logp_list.size())
-    print(value.size())
+    parser = argparse.ArgumentParser(description='Run AttentionNet model')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
+    parser.add_argument('--num_agents', type=int, default=10, help='Number of agents')
+    parser.add_argument('--num_tasks', type=int, default=20, help='Number of tasks')
+    
+    # Parse arguments
+    args = parser.parse_args()
+
+    # Define input dimensions and other parameters
+    agent_input_dim = 107  # 7 regular features + 100 for 10x10 affordance map
+    task_input_dim = 5
+    embedding_dim = 128
+    perception_range = 5  # Assuming a 5x5 affordance map
+
+    model = AttentionNet(agent_input_dim, task_input_dim, embedding_dim, perception_range)
+    
+    agents = torch.rand((args.batch_size, args.num_agents, agent_input_dim))
+    tasks = torch.rand((args.batch_size, args.num_tasks, task_input_dim))
+    mask = torch.ones((args.batch_size, args.num_tasks, args.num_agents), dtype=torch.bool)
+    logp_list = model(tasks, agents, mask)
+
+    print("Output shape:", logp_list.size())
